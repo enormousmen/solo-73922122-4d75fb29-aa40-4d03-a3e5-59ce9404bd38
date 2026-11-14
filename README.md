@@ -3,7 +3,9 @@
 FastAPI + SQLite + `cryptography` 实现的单课题 TIFF 加密归档网页：每件影像以独立随机
 数据密钥（DEK）做 AES-256-GCM 加密，DEK 再由课题密钥（KEK，AES-256-GCM）封装后入库；
 密文与课题密钥**分目录持久保存**，原件明文与数据密钥**绝不落盘**。支持上传、下载、
-课题密钥轮换及进度查看，轮换期间上传下载照常，重启自动续办。
+课题密钥轮换及进度查看，轮换期间上传下载照常，重启自动续办。内置**完整性巡检**：
+一键核查全部已登记影像的密钥文件、DEK 封装、密文认证与解密后大小/SHA-256，
+按文件逐件给出「可读 / 故障 / 待复核」结论，巡检期间上传、下载、轮换照常进行。
 
 ## 一、快速开始
 
@@ -51,7 +53,10 @@ ARCHIVE_DATA_DIR=./data uvicorn app.main:app --host 127.0.0.1 --port 8000
 2. **演示控制（暂停点）**：可分别暂停/恢复“上传待登记”和“下载待解封”两个闸门；
 3. **上传**：选择 `.tif/.tiff`（每件 ≤ 8 MiB），页面展示三阶段状态机；
 4. **已归档影像与下载**：查看每件影像当前封装在哪个 KEK 下，发起两阶段下载；
-5. **操作日志**：所有关键动作带时间戳输出。
+5. **完整性巡检**：一键发起，只核查发起瞬间已登记的影像；逐件核对课题密钥文件、
+   数据密钥封装、密文认证与解密后大小/SHA-256，按文件 ID 显示「可读 / 故障 / 待复核」
+   及原因，本轮全部核查完毕才显示“巡检完成”；
+6. **操作日志**：所有关键动作带时间戳输出。
 
 ## 三、本地演示脚本
 
@@ -86,9 +91,11 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-9 个端到端测试（FastAPI TestClient + 真实 SQLite/文件系统），覆盖：明文不落盘不变量、
+17 个端到端测试（FastAPI TestClient + 真实 SQLite/文件系统），覆盖：明文不落盘不变量、
 8 MiB 上限、轮换只重封装 DEK 且密文逐字节不变、旧 KEK 文件删除后才报完成、两个暂停点、
-在途下载读完原件、同期只允许一次轮换、轮换中重启续办、重启清理暂存。
+在途下载读完原件、同期只允许一次轮换、轮换中重启续办、重启清理暂存，以及完整性巡检：
+只核查发起时已登记影像、逐件失败原因（坏密文/坏封装/坏密钥文件）且单件损坏不中断、
+核验期间换钥用新封装重验或标待复核、巡检与上传/下载/轮换并发、同期只允许一轮、重启续办。
 
 ## 五、HTTP API 摘要
 
@@ -103,6 +110,8 @@ pytest -q
 | POST | `/api/downloads/{id}/abort` | 中止下载 |
 | POST | `/api/rotations` | 发起轮换（已有轮换时 409） |
 | GET | `/api/rotations/current` | 轮换状态与进度（页面 1.5s 轮询） |
+| POST | `/api/inspections` | 发起完整性巡检（已有巡检时 409），快照当前已登记影像 |
+| GET | `/api/inspections/current` | 最近一轮巡检状态与逐件结论（页面 1.5s 轮询） |
 | GET | `/api/files` `/api/keys` `/api/uploads` `/api/downloads` | 列表查询 |
 | POST | `/api/demo/gates/{upload_register,download_unwrap}` | 演示暂停门 `{"paused": true/false}` |
 
@@ -129,17 +138,24 @@ pytest -q
    后台线程续办；已归档文件的 DEK 始终能被某个未删除的 KEK 解封，因此**始终可解密**。
 9. **并发模型**：单进程多线程，所有 SQLite 访问与共享状态在一把可重入锁内串行化，
    SQLite 另开 WAL + `busy_timeout` 兜底；密钥文件、blob 均为原子替换写入。
+10. **完整性巡检**：发起时把当前已登记影像快照进 `inspection_items`，之后上传的不属于
+    本轮；后台线程逐件核查（锁内取快照 → **锁外**读密钥文件/解封/解密/核对大小与
+    SHA-256 → 锁内记录结论），上传、下载、轮换不被阻塞；单件损坏只记该件「故障」并继续。
+    核验期间若该件的课题密钥封装被轮换更新，旧钥核验结果作废，自动用新封装重验，
+    连续变更则标「待复核」——不凭旧钥结果判断现在可读；全部明细到达终态才把轮次置为
+    `completed`，重启后未完成的巡检自动续办。核验只读密钥文件与密文，明文与 DEK
+    仅在内存出现，巡检表只存元数据与原因。
 
 ## 七、目录结构
 
 ```
 app/
 ├── crypto.py          # AES-256-GCM 原语：DEK/KEK 生成、封装/解封、密钥文件原子读写
-├── db.py              # SQLite schema（project_keys/files/uploads/downloads/rotations）
-├── service.py         # 状态机、轮换工作线程、暂停门、崩溃恢复（核心）
+├── db.py              # SQLite schema（project_keys/files/uploads/downloads/rotations/inspections）
+├── service.py         # 状态机、轮换与巡检工作线程、暂停门、崩溃恢复（核心）
 ├── main.py            # FastAPI 路由与 lifespan
 └── static/index.html  # 浏览器单页应用
 scripts/demo.sh        # 三类场景的本地演示脚本
-tests/test_archive.py  # 9 个端到端测试
+tests/test_archive.py  # 17 个端到端测试
 Dockerfile, docker-compose.yml
 ```

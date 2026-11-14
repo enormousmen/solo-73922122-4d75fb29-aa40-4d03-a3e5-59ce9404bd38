@@ -16,12 +16,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from cryptography.exceptions import InvalidTag
+
 from . import crypto
 from .db import connect
 
 MAX_FILE_SIZE = 8 * 1024 * 1024  # 每件不超过 8 MiB
 WORKER_POLL_SECONDS = 0.1
 GATE_WAIT_SECONDS = 1.0
+# 巡检中单件影像的封装若被轮换连续更新，重验这么多次后标“待复核”。
+INSPECTION_MAX_ATTEMPTS = 5
 
 
 class ServiceError(Exception):
@@ -98,12 +102,15 @@ class Service:
         self._kek_cache: dict[int, bytes] = {}
         # 运行中的轮换线程（同期只允许一个）
         self._rotation_thread: threading.Thread | None = None
+        # 运行中的巡检线程（同期只允许一轮）
+        self._inspection_thread: threading.Thread | None = None
 
         self.upload_gate = PauseGate("upload_register")
         self.download_gate = PauseGate("download_unwrap")
 
         self._recover()
         self._ensure_rotation_worker()
+        self._ensure_inspection_worker()
 
     def close(self) -> None:
         self.stop_event.set()
@@ -757,6 +764,283 @@ class Service:
             "completed_at": row["completed_at"],
             "message": row["message"],
         }
+
+    # ------------------------------------------------------------------ #
+    # 完整性巡检：只核查发起时已登记的影像；逐件核对课题密钥文件、
+    # 数据密钥封装、密文认证与解密后大小/SHA-256。核验在锁外进行，
+    # 上传/下载/轮换不受阻塞；单件损坏只影响该件结论。
+    # ------------------------------------------------------------------ #
+    def start_inspection(self) -> dict[str, Any]:
+        with self.lock:
+            if self._row("SELECT id FROM inspections WHERE state='running'") is not None:
+                raise ServiceError("已有巡检进行中，同期只允许一轮", 409)
+            inspection_id = uuid.uuid4().hex
+            now = self._now()
+            cur = self.conn.execute(
+                "INSERT INTO inspections (inspection_id, state, total, started_at) "
+                "VALUES (?, 'running', 0, ?)",
+                (inspection_id, now),
+            )
+            insp_pk = cur.lastrowid
+            # 快照发起瞬间已登记的影像；之后才归档的不属于本轮。
+            files = self._all("SELECT file_id, filename FROM files ORDER BY id")
+            for f in files:
+                self.conn.execute(
+                    "INSERT INTO inspection_items (inspection_id, file_id, filename, state) "
+                    "VALUES (?,?,?, 'pending')",
+                    (insp_pk, f["file_id"], f["filename"]),
+                )
+            self.conn.execute(
+                "UPDATE inspections SET total=? WHERE id=?", (len(files), insp_pk)
+            )
+            self.conn.commit()
+        self._ensure_inspection_worker()
+        return self.inspection_status()
+
+    def _ensure_inspection_worker(self) -> None:
+        with self.lock:
+            insp = self._row(
+                "SELECT * FROM inspections WHERE state='running' ORDER BY id DESC LIMIT 1"
+            )
+            if insp is None:
+                return
+            if self._inspection_thread is not None and self._inspection_thread.is_alive():
+                return
+            t = threading.Thread(
+                target=self._inspection_worker,
+                args=(insp["inspection_id"],),
+                name=f"inspection-{insp['inspection_id'][:8]}",
+                daemon=True,
+            )
+            self._inspection_thread = t
+            t.start()
+
+    def _inspection_worker(self, inspection_id: str) -> None:
+        """后台逐件核查。每次循环处理一件：锁内取快照 → 锁外核验 →
+        锁内比对封装是否被轮换更新并记录结论。"""
+        attempts: dict[int, int] = {}  # item 主键 -> 已重验次数（进程内存即可）
+        while not self.stop_event.is_set():
+            try:
+                with self.lock:
+                    insp = self._row(
+                        "SELECT * FROM inspections WHERE inspection_id=?",
+                        (inspection_id,),
+                    )
+                    if insp is None or insp["state"] != "running":
+                        return
+                    item = self._row(
+                        "SELECT * FROM inspection_items WHERE inspection_id=? "
+                        "AND state='pending' ORDER BY id LIMIT 1",
+                        (insp["id"],),
+                    )
+                    if item is None:
+                        # 本轮所有影像均已核查，才允许报完成。
+                        self._finalize_inspection_locked(insp)
+                        return
+                    f = self._row("SELECT * FROM files WHERE file_id=?", (item["file_id"],))
+                    if f is None:
+                        # 本系统不删除归档文件；兜底记故障，不影响其余件。
+                        self._record_inspection_item(
+                            item["id"], "failed", "归档记录在巡检期间消失",
+                            None, attempts.get(item["id"], 0) + 1,
+                        )
+                        continue
+                    kek_row = self._row(
+                        "SELECT * FROM project_keys WHERE id=?", (f["current_kek_id"],)
+                    )
+                    snap = {
+                        "kek_pk": f["current_kek_id"],
+                        "key_path": self._kek_path(kek_row["key_id"]) if kek_row else None,
+                        "wrapped_dek": bytes(f["wrapped_dek"]),
+                        "dek_nonce": bytes(f["dek_nonce"]),
+                        "blob_path": f["blob_path"],
+                        "size": f["size"],
+                        "sha256": f["sha256"],
+                    }
+                # ---- 锁外核验：密钥文件与密文只读，明文与 DEK 仅在内存 ----
+                try:
+                    ok, reason = self._verify_snapshot(snap)
+                except Exception as exc:  # noqa: BLE001 单件异常不得中断巡检
+                    ok, reason = False, f"核验过程异常：{exc}"
+                with self.lock:
+                    f2 = self._row("SELECT * FROM files WHERE file_id=?", (item["file_id"],))
+                    if f2 is None:
+                        self._record_inspection_item(
+                            item["id"], "failed", "归档记录在巡检期间消失",
+                            None, attempts.get(item["id"], 0) + 1,
+                        )
+                        continue
+                    changed = (
+                        f2["current_kek_id"] != snap["kek_pk"]
+                        or bytes(f2["wrapped_dek"]) != snap["wrapped_dek"]
+                        or bytes(f2["dek_nonce"]) != snap["dek_nonce"]
+                    )
+                    if changed:
+                        # 核验期间换了课题密钥/封装：旧钥核验结果作废，
+                        # 必须用新封装重验；连续变更则标待复核。
+                        n = attempts.get(item["id"], 0) + 1
+                        attempts[item["id"]] = n
+                        if n >= INSPECTION_MAX_ATTEMPTS:
+                            self._record_inspection_item(
+                                item["id"], "review",
+                                f"核验期间课题密钥封装连续变更 {n} 次，"
+                                "不能凭旧钥的核验结果判断现在可读，待复核",
+                                f2["current_kek_id"], n,
+                            )
+                        # 否则保持 pending，下一轮用新封装重验。
+                    else:
+                        self._record_inspection_item(
+                            item["id"],
+                            "readable" if ok else "failed",
+                            "" if ok else reason,
+                            snap["kek_pk"],
+                            attempts.get(item["id"], 0) + 1,
+                        )
+            except sqlite3.Error:
+                if self.stop_event.is_set():
+                    return  # 服务关闭中，连接已关闭；重启后会续办。
+                time.sleep(1.0)
+                continue
+            time.sleep(WORKER_POLL_SECONDS)
+
+    def _verify_snapshot(self, snap: dict[str, Any]) -> tuple[bool, str]:
+        """按快照逐件核对，返回 (是否可读, 失败原因)。
+
+        不持有 Service.lock 调用：只读密钥文件与密文，解密全部在内存完成，
+        原件明文与数据密钥绝不落盘。
+        """
+        # 1) 课题密钥文件：必须真实存在于磁盘且格式正确（刻意从磁盘读，不用内存缓存）。
+        key_path = snap["key_path"]
+        if key_path is None:
+            return False, "课题密钥记录缺失"
+        if not os.path.exists(key_path):
+            return False, f"课题密钥文件缺失（KEK #{snap['kek_pk']}）"
+        try:
+            kek = crypto.load_kek_file(key_path)
+        except (OSError, ValueError):
+            return False, f"课题密钥文件损坏或不可读（KEK #{snap['kek_pk']}）"
+
+        # 2) 数据密钥封装：必须能被课题密钥正确解封。
+        try:
+            dek = crypto.unwrap_dek(kek, snap["dek_nonce"], snap["wrapped_dek"])
+        except InvalidTag:
+            return False, "数据密钥封装解封失败（封装损坏或与课题密钥不匹配）"
+        except ValueError as exc:
+            return False, f"数据密钥封装异常：{exc}"
+
+        # 3) 密文存在且通过 GCM 认证标签校验。
+        try:
+            with open(snap["blob_path"], "rb") as bf:
+                blob = bf.read()
+        except FileNotFoundError:
+            return False, "密文文件缺失（vault 中无此文件）"
+        except OSError as exc:
+            return False, f"密文读取失败：{exc}"
+        if len(blob) < crypto.NONCE_SIZE + 16:
+            return False, "密文长度异常（不足 nonce + 认证标签）"
+        nonce, ciphertext = blob[: crypto.NONCE_SIZE], blob[crypto.NONCE_SIZE:]
+        try:
+            plaintext = crypto.decrypt_blob(dek, nonce, ciphertext)
+        except InvalidTag:
+            return False, "密文认证失败（GCM 标签校验未通过，密文已损坏或被篡改）"
+
+        # 4) 解密后的大小与登记 SHA-256。
+        if len(plaintext) != snap["size"]:
+            return (
+                False,
+                f"解密后大小不符：登记 {snap['size']} 字节，实际 {len(plaintext)} 字节",
+            )
+        if hashlib.sha256(plaintext).hexdigest() != snap["sha256"]:
+            return False, "解密后 SHA-256 与登记摘要不符"
+        return True, ""
+
+    def _record_inspection_item(
+        self,
+        item_pk: int,
+        state: str,
+        reason: str,
+        kek_pk: int | None,
+        attempts: int,
+    ) -> None:
+        self.conn.execute(
+            "UPDATE inspection_items SET state=?, reason=?, kek_id=?, attempts=?, "
+            "checked_at=? WHERE id=?",
+            (state, reason or None, kek_pk, attempts, self._now(), item_pk),
+        )
+        self.conn.commit()
+
+    def _finalize_inspection_locked(self, insp: sqlite3.Row) -> None:
+        counts = {
+            r["state"]: r["c"]
+            for r in self._all(
+                "SELECT state, COUNT(*) AS c FROM inspection_items "
+                "WHERE inspection_id=? GROUP BY state",
+                (insp["id"],),
+            )
+        }
+        if counts.get("pending", 0):
+            return  # 还有未核查明细，不得报完成。
+        self.conn.execute(
+            "UPDATE inspections SET state='completed', completed_at=?, readable=?, "
+            "failed=?, review=? WHERE id=?",
+            (
+                self._now(),
+                counts.get("readable", 0),
+                counts.get("failed", 0),
+                counts.get("review", 0),
+                insp["id"],
+            ),
+        )
+        self.conn.commit()
+
+    def inspection_status(self) -> dict[str, Any]:
+        with self.lock:
+            insp = self._row("SELECT * FROM inspections ORDER BY id DESC LIMIT 1")
+            if insp is None:
+                return {
+                    "active": False,
+                    "state": "idle",
+                    "inspection_id": None,
+                    "total": 0,
+                    "checked": 0,
+                    "readable": 0,
+                    "failed": 0,
+                    "review": 0,
+                    "pending": 0,
+                    "started_at": None,
+                    "completed_at": None,
+                    "items": [],
+                }
+            items = self._all(
+                "SELECT * FROM inspection_items WHERE inspection_id=? ORDER BY id",
+                (insp["id"],),
+            )
+            counts = {"pending": 0, "readable": 0, "failed": 0, "review": 0}
+            for it in items:
+                counts[it["state"]] += 1
+            checked = counts["readable"] + counts["failed"] + counts["review"]
+            return {
+                "active": insp["state"] == "running",
+                "state": insp["state"],
+                "inspection_id": insp["inspection_id"],
+                "total": insp["total"],
+                "checked": checked,
+                **counts,
+                "started_at": insp["started_at"],
+                "completed_at": insp["completed_at"],
+                "items": [
+                    {
+                        "file_id": it["file_id"],
+                        "filename": it["filename"],
+                        "state": it["state"],
+                        "reason": it["reason"],
+                        "kek_id": it["kek_id"],
+                        "attempts": it["attempts"],
+                        "checked_at": it["checked_at"],
+                    }
+                    for it in items
+                ],
+            }
 
     # ------------------------------------------------------------------ #
     # 列表与演示门控制

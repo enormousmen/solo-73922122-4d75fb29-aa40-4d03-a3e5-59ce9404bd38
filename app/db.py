@@ -87,6 +87,36 @@ CREATE TABLE IF NOT EXISTS rotations (
     completed_at        TEXT,
     message             TEXT
 );
+
+-- 完整性巡检：一轮巡检只覆盖发起瞬间已登记的影像（快照进 inspection_items），
+-- 全部明细到达终态后才把轮次置为 completed。
+CREATE TABLE IF NOT EXISTS inspections (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    inspection_id TEXT UNIQUE NOT NULL,
+    state         TEXT NOT NULL CHECK (state IN ('running', 'completed')),
+    total         INTEGER NOT NULL,
+    readable      INTEGER NOT NULL DEFAULT 0,
+    failed        INTEGER NOT NULL DEFAULT 0,
+    review        INTEGER NOT NULL DEFAULT 0,
+    started_at    TEXT NOT NULL,
+    completed_at  TEXT
+);
+
+-- 巡检明细：每件影像的核查结论（pending -> readable/failed/review）。
+-- 只存元数据与失败原因；原件明文与数据密钥只出现在内存，绝不写入本表。
+CREATE TABLE IF NOT EXISTS inspection_items (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    inspection_id INTEGER NOT NULL REFERENCES inspections(id),
+    file_id       TEXT NOT NULL,
+    filename      TEXT NOT NULL,
+    state         TEXT NOT NULL CHECK (state IN (
+                      'pending', 'readable', 'failed', 'review')),
+    reason        TEXT,
+    kek_id        INTEGER,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    checked_at    TEXT,
+    UNIQUE (inspection_id, file_id)
+);
 """
 
 

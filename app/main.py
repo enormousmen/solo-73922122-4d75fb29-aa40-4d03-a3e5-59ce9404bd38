@@ -149,6 +149,17 @@ def rotation_status() -> dict[str, Any]:
     return svc().rotation_status()
 
 
+# --------------------------- 完整性巡检 --------------------------- #
+@app.post("/api/inspections", status_code=201)
+def start_inspection() -> dict[str, Any]:
+    return svc().start_inspection()
+
+
+@app.get("/api/inspections/current")
+def inspection_status() -> dict[str, Any]:
+    return svc().inspection_status()
+
+
 # --------------------------- 演示暂停门 --------------------------- #
 @app.post("/api/demo/gates/{name}")
 def set_gate(name: str, body: GateBody = Body(...)) -> dict[str, Any]:

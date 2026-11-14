@@ -41,6 +41,9 @@
   .b-completed { background: rgba(63,185,80,.15); color: var(--green); }
   .b-created { background: rgba(79,156,249,.16); color: var(--accent); }
   .b-idle { background: rgba(139,152,169,.18); color: var(--muted); }
+  .b-readable { background: rgba(63,185,80,.15); color: var(--green); }
+  .b-review { background: rgba(210,153,34,.16); color: var(--amber); }
+  .b-pending { background: rgba(79,156,249,.16); color: var(--accent); }
   .progress { height: 10px; background: var(--panel2); border-radius: 6px; overflow: hidden; margin: 8px 0 6px; }
   .progress > div { height: 100%; background: linear-gradient(90deg, var(--accent), var(--purple)); transition: width .3s; }
   .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 12.5px; }
@@ -145,6 +148,23 @@
     <table><thead><tr><th>download_id</th><th>文件</th><th>使用 KEK</th><th>状态</th><th>时间</th><th></th></tr></thead>
       <tbody id="downloads-body"></tbody></table>
   </section>
+
+  <!-- 完整性巡检 -->
+  <section class="panel full">
+    <h2>⑤ 完整性巡检 <span class="hint">只核查发起时已登记的影像；核验期间上传、下载、密钥轮换照常进行</span></h2>
+    <div class="row">
+      <button id="btn-inspect">发起巡检</button>
+      <span class="badge b-idle" id="insp-state">idle</span>
+      <span class="small" id="insp-summary">尚未发起巡检</span>
+    </div>
+    <div class="progress"><div id="insp-bar" style="width:0%"></div></div>
+    <table><thead><tr><th>file_id</th><th>文件名</th><th>结果</th><th>原因</th><th>核验 KEK</th><th>尝试</th><th>核验时间</th></tr></thead>
+      <tbody id="insp-body"></tbody></table>
+    <p class="small">逐件核对：课题密钥文件 → 数据密钥封装 → 密文认证 → 解密后大小与登记 SHA-256。
+      核验全部在内存进行，原件明文与数据密钥不落盘；若核验期间某件的课题密钥封装被轮换更新，
+      该件自动改用新封装重验，连续变更则标为「待复核」——绝不凭旧钥的核验结果判断现在可读。
+      本轮全部影像核查完毕后才会显示「巡检完成」。</p>
+  </section>
 </main>
 
 <script>
@@ -216,13 +236,26 @@ async function setGate(name, paused) {
   } catch (e) { log(e.message, 'err'); }
 }
 
+// ---------- 完整性巡检 ----------
+const inspLabel = { pending: '待核查', readable: '可读', failed: '故障', review: '待复核' };
+const ibadge = (s) => `<span class="badge b-${esc(s)}">${esc(inspLabel[s] || s)}</span>`;
+let inspWasActive = false;
+$('btn-inspect').onclick = async () => {
+  try {
+    const r = await api('POST', '/api/inspections');
+    log(`已发起完整性巡检：本轮快照 ${r.total} 件已登记影像`, 'info');
+    await refresh();
+  } catch (e) { log('巡检被拒绝：' + e.message, 'err'); }
+};
+
 // ---------- 轮询渲染 ----------
 async function refresh() {
   try {
-    const [cfg, status, keys, files, uploads, downloads] = await Promise.all([
+    const [cfg, status, keys, files, uploads, downloads, insp] = await Promise.all([
       api('GET','/api/config'), api('GET','/api/rotations/current'),
       api('GET','/api/keys'), api('GET','/api/files'),
       api('GET','/api/uploads'), api('GET','/api/downloads'),
+      api('GET','/api/inspections/current'),
     ]);
     $('health').textContent = '服务在线 · 上限 ' + cfg.max_file_size_mib + ' MiB/件';
     $('upload-hint').textContent = `单文件上限 ${cfg.max_file_size_mib} MiB`;
@@ -272,6 +305,35 @@ async function refresh() {
     const gu = status.gates.upload_register, gd = status.gates.download_unwrap;
     $('g-up-state').textContent = (gu.paused ? '已暂停 · 等待 ' : '放行中 · 等待 ') + gu.waiting;
     $('g-dl-state').textContent = (gd.paused ? '已暂停 · 等待 ' : '放行中 · 等待 ') + gd.waiting;
+
+    // 完整性巡检
+    $('btn-inspect').disabled = insp.active;
+    if (!insp.inspection_id) {
+      $('insp-state').textContent = 'idle'; $('insp-state').className = 'badge b-idle';
+      $('insp-summary').textContent = '尚未发起巡检';
+      $('insp-bar').style.width = '0%';
+      $('insp-body').innerHTML = '<tr><td colspan="7" class="small">暂无巡检记录</td></tr>';
+    } else {
+      $('insp-state').textContent = insp.active ? '巡检中' : '巡检完成';
+      $('insp-state').className = 'badge ' + (insp.active ? 'b-running' : 'b-completed');
+      const pct = insp.total ? Math.round(insp.checked / insp.total * 100) : (insp.active ? 0 : 100);
+      $('insp-bar').style.width = pct + '%';
+      $('insp-summary').textContent =
+        `已核查 ${insp.checked}/${insp.total} · 可读 ${insp.readable} · 故障 ${insp.failed} · 待复核 ${insp.review}`
+        + (insp.active ? '' : ` · 巡检完成于 ${insp.completed_at}`);
+      $('insp-body').innerHTML = insp.items.map(it =>
+        `<tr><td class="mono">${short(it.file_id)}</td><td class="truncate" title="${esc(it.filename)}">${esc(it.filename)}</td>
+         <td>${ibadge(it.state)}</td>
+         <td class="small">${it.reason ? esc(it.reason) : '—'}</td>
+         <td class="mono">${it.kek_id ? '#' + it.kek_id : '—'}</td>
+         <td>${it.attempts || ''}</td><td class="small">${esc(it.checked_at || '—')}</td></tr>`
+      ).join('') || '<tr><td colspan="7" class="small">本轮无已登记影像</td></tr>';
+      if (inspWasActive && !insp.active) {
+        log(`巡检完成：可读 ${insp.readable} · 故障 ${insp.failed} · 待复核 ${insp.review}`,
+            (insp.failed || insp.review) ? 'err' : 'ok');
+      }
+    }
+    inspWasActive = !!insp.active;
 
     // 上传步骤条（取最新一条上传）
     const latest = uploads[0];

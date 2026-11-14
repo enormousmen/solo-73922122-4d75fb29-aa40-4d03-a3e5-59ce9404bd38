@@ -7,7 +7,9 @@
 4. 上传待登记暂停：收尾后不留下旧钥引用；
 5. 下载待解封暂停：已受理下载必须读完原件；
 6. 轮换中重启自动续办，已归档文件始终可解密；
-7. 同期只允许一次轮换。
+7. 同期只允许一次轮换；
+8. 完整性巡检：只核查发起时已登记影像，逐件核对密钥文件/封装/密文/摘要，
+   单件损坏不中断，换钥重验或标待复核，巡检期间上传/下载/轮换照常，重启续办。
 """
 
 from __future__ import annotations
@@ -19,8 +21,9 @@ import time
 
 import pytest
 
+from app import crypto
 from app.main import app
-from app.service import MAX_FILE_SIZE
+from app.service import INSPECTION_MAX_ATTEMPTS, MAX_FILE_SIZE, Service
 from fastapi.testclient import TestClient
 
 
@@ -353,3 +356,225 @@ class TestArchive:
             # 重新上传仍然成功。
             new_id = _upload(client, payload, "orphan.tif")
             assert _download(client, new_id) == payload
+
+
+class TestInspection:
+    """完整性巡检：只核查发起时已登记影像，逐件出结论，单件损坏不中断。"""
+
+    @staticmethod
+    def _wait_completed(client: TestClient, timeout: float = 20.0) -> dict:
+        return wait_until(lambda: (
+            (s := client.get("/api/inspections/current").json())["inspection_id"]
+            and not s["active"]
+            and s
+        ), timeout=timeout)
+
+    def test_all_readable_and_snapshot_scope(self, svc):
+        client, _ = svc
+        fid_a = _upload(client, make_tiff(700, 1), "a.tif")
+        r = client.post("/api/inspections")
+        assert r.status_code == 201, r.text
+        assert r.json()["total"] == 1 and r.json()["active"] is True
+
+        # 发起之后才登记的影像不属于本轮巡检。
+        fid_b = _upload(client, make_tiff(800, 2), "b.tif")
+        st = self._wait_completed(client)
+        assert st["state"] == "completed" and st["completed_at"]
+        assert st["total"] == 1 and st["checked"] == 1
+        assert (st["readable"], st["failed"], st["review"]) == (1, 0, 0)
+        item = st["items"][0]
+        assert item["file_id"] == fid_a and item["state"] == "readable"
+        assert item["attempts"] == 1 and item["reason"] is None
+        active_kek = client.get("/api/rotations/current").json()["active_kek"]["id"]
+        assert item["kek_id"] == active_kek
+
+        # 第二轮覆盖两件（含第一轮后登记的 b.tif）。
+        assert client.post("/api/inspections").status_code == 201
+        st = self._wait_completed(client)
+        assert st["total"] == 2 and st["readable"] == 2
+        assert {it["file_id"] for it in st["items"]} == {fid_a, fid_b}
+
+    def test_corruption_per_item_with_reasons_and_others_continue(self, svc, tmp_data):
+        client, service = svc
+        ok_id = _upload(client, make_tiff(900, 3), "ok.tif")
+        blob_id = _upload(client, make_tiff(900, 4), "badblob.tif")
+        wrap_id = _upload(client, make_tiff(900, 5), "badwrap.tif")
+
+        # 损坏密文（翻转认证标签末字节）。
+        blob_path = os.path.join(tmp_data, "vault", blob_id + ".blob")
+        with open(blob_path, "r+b") as fh:
+            fh.seek(-1, os.SEEK_END)
+            last = fh.read(1)
+            fh.seek(-1, os.SEEK_END)
+            fh.write(bytes([last[0] ^ 0x01]))
+        # 损坏数据库中封装后的 DEK。
+        with service.lock:
+            row = service._row("SELECT wrapped_dek FROM files WHERE file_id=?", (wrap_id,))
+            bad = bytes([row["wrapped_dek"][0] ^ 0x01]) + bytes(row["wrapped_dek"][1:])
+            service.conn.execute(
+                "UPDATE files SET wrapped_dek=? WHERE file_id=?", (bad, wrap_id)
+            )
+            service.conn.commit()
+
+        assert client.post("/api/inspections").status_code == 201
+        st = self._wait_completed(client)
+        # 单件损坏不中断：三件全部核查完毕才报完成。
+        assert st["checked"] == 3 and st["readable"] == 1 and st["failed"] == 2
+        items = {it["file_id"]: it for it in st["items"]}
+        assert items[ok_id]["state"] == "readable"
+        assert items[blob_id]["state"] == "failed"
+        assert "密文认证" in items[blob_id]["reason"]
+        assert items[wrap_id]["state"] == "failed"
+        assert "封装" in items[wrap_id]["reason"]
+
+        # 巡检不写任何明文：数据目录任何文件中都找不到三件原件字节。
+        for seed in (3, 4, 5):
+            payload = make_tiff(900, seed)
+            for root, _dirs, files in os.walk(tmp_data):
+                for name in files:
+                    with open(os.path.join(root, name), "rb") as fh:
+                        assert payload not in fh.read()
+
+    def test_kek_file_corrupt_and_missing_detected(self, svc, tmp_data):
+        client, _ = svc
+        _upload(client, make_tiff(600, 6), "k.tif")
+        kek = next(k for k in client.get("/api/keys").json() if k["status"] == "active")
+        kek_path = os.path.join(tmp_data, "keys", kek["key_id"] + ".kek")
+
+        # 密钥文件损坏（魔数/长度不符）——必须读磁盘文件而非内存缓存才能发现。
+        with open(kek_path, "wb") as fh:
+            fh.write(b"garbage")
+        assert client.post("/api/inspections").status_code == 201
+        item = self._wait_completed(client)["items"][0]
+        assert item["state"] == "failed" and "课题密钥文件" in item["reason"]
+
+        # 密钥文件丢失。
+        os.unlink(kek_path)
+        assert client.post("/api/inspections").status_code == 201
+        item = self._wait_completed(client)["items"][0]
+        assert item["state"] == "failed" and "缺失" in item["reason"]
+
+    def test_reverify_with_new_wrapping_after_rotation(self, svc, monkeypatch):
+        client, _ = svc
+        fid = _upload(client, make_tiff(640, 7), "rot.tif")
+        old_kek = client.get("/api/rotations/current").json()["active_kek"]["id"]
+        orig = Service._verify_snapshot
+        calls = {"n": 0}
+
+        def spy(self, snap):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # 核验期间发起并完成一轮轮换：该文件被重封装到新课题密钥。
+                client.post("/api/rotations")
+                wait_until(lambda: not client.get("/api/rotations/current").json()["active"])
+            return orig(self, snap)
+
+        monkeypatch.setattr(Service, "_verify_snapshot", spy)
+        assert client.post("/api/inspections").status_code == 201
+        item = self._wait_completed(client)["items"][0]
+        # 旧钥核验结果作废，用新封装重验通过；结论记在新 KEK 上。
+        assert item["state"] == "readable" and item["attempts"] == 2
+        assert item["kek_id"] != old_kek
+        assert _download(client, fid) == make_tiff(640, 7)
+
+    def test_review_when_wrapping_keeps_changing(self, svc, monkeypatch):
+        client, _ = svc
+        fid = _upload(client, make_tiff(640, 8), "churn.tif")
+        orig = Service._verify_snapshot
+
+        def spy(self, snap):
+            # 每次核验前都真材实料地重封装一次（模拟连续轮换），旧快照永远失效。
+            with self.lock:
+                row = self._row("SELECT * FROM files WHERE file_id=?", (fid,))
+                kek = self._get_kek(row["current_kek_id"])
+                dek = crypto.unwrap_dek(kek, row["dek_nonce"], row["wrapped_dek"])
+                nn = crypto.new_nonce()
+                wd = crypto.wrap_dek(kek, nn, dek)
+                self.conn.execute(
+                    "UPDATE files SET wrapped_dek=?, dek_nonce=? WHERE file_id=?",
+                    (wd, nn, fid),
+                )
+                self.conn.commit()
+            return orig(self, snap)
+
+        monkeypatch.setattr(Service, "_verify_snapshot", spy)
+        assert client.post("/api/inspections").status_code == 201
+        item = self._wait_completed(client)["items"][0]
+        assert item["state"] == "review" and "待复核" in item["reason"]
+        assert item["attempts"] == INSPECTION_MAX_ATTEMPTS
+        # 重封装是真实有效的：影像仍可正常下载。
+        assert _download(client, fid) == make_tiff(640, 8)
+
+    def test_concurrent_inspection_rejected(self, svc, monkeypatch):
+        client, _ = svc
+        _upload(client, make_tiff(500, 9), "x.tif")
+        orig = Service._verify_snapshot
+
+        def slow(self, snap):
+            time.sleep(0.3)
+            return orig(self, snap)
+
+        monkeypatch.setattr(Service, "_verify_snapshot", slow)
+        assert client.post("/api/inspections").status_code == 201
+        assert client.post("/api/inspections").status_code == 409
+        self._wait_completed(client)
+
+    def test_upload_download_rotation_work_during_inspection(self, svc, monkeypatch):
+        client, _ = svc
+        payloads = {f"f{i}.tif": make_tiff(500 + i * 13, 20 + i) for i in range(3)}
+        ids = {name: _upload(client, p, name) for name, p in payloads.items()}
+        orig = Service._verify_snapshot
+
+        def slow(self, snap):
+            time.sleep(0.25)  # 拉长巡检窗口，验证期间其他操作照常
+            return orig(self, snap)
+
+        monkeypatch.setattr(Service, "_verify_snapshot", slow)
+        assert client.post("/api/inspections").status_code == 201
+        assert client.get("/api/inspections/current").json()["active"] is True
+
+        errors: list[str] = []
+        new_ids: list[str] = []
+
+        def ops():
+            try:
+                new_ids.append(_upload(client, make_tiff(610, 30), "during.tif"))
+                assert _download(client, ids["f0.tif"]) == payloads["f0.tif"]
+                assert client.post("/api/rotations").status_code == 201
+                wait_until(lambda: not client.get("/api/rotations/current").json()["active"])
+            except Exception as exc:  # noqa: BLE001
+                errors.append(str(exc))
+
+        t = threading.Thread(target=ops)
+        t.start()
+        t.join(timeout=20)
+        assert not errors, errors
+
+        st = self._wait_completed(client)
+        # 巡检期间上传的 during.tif 不属于本轮；本轮三件全部可读。
+        assert st["total"] == 3
+        assert all(it["state"] == "readable" for it in st["items"])
+        assert _download(client, new_ids[0]) == make_tiff(610, 30)
+
+    def test_restart_resumes_inspection(self, tmp_data, monkeypatch):
+        monkeypatch.setenv("ARCHIVE_DATA_DIR", tmp_data)
+        payloads = {f"r{i}.tif": make_tiff(400 + i * 11, 40 + i) for i in range(4)}
+        orig = Service._verify_snapshot
+
+        def slow(self, snap):
+            time.sleep(0.25)
+            return orig(self, snap)
+
+        monkeypatch.setattr(Service, "_verify_snapshot", slow)
+        with TestClient(app) as client:
+            ids = {name: _upload(client, p, name) for name, p in payloads.items()}
+            assert client.post("/api/inspections").status_code == 201
+            wait_until(lambda: client.get("/api/inspections/current").json()["checked"] >= 1)
+            # 进程退出时巡检尚未完成，剩余明细仍为 pending。
+
+        with TestClient(app) as client:
+            st = self._wait_completed(client)
+            assert st["total"] == 4 and st["checked"] == 4
+            assert all(it["state"] == "readable" for it in st["items"])
+            for name, p in payloads.items():
+                assert _download(client, ids[name]) == p
